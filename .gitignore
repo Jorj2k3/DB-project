@@ -1,0 +1,33 @@
+# Python virtual environments & bytecode cache
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Environment variables & local secrets
+.env
+.env.local
+
+# Generated synthetic datasets & large Kaggle CSVs (keep repo lightweight)
+data/*.csv
+data/*.parquet
+data/*.zip
+*.csv
+
+# Benchmark outputs & local logs
+results/
+*.log
+
+# Local Docker volume folders (if bind-mounted locally)
+pg_data/
+redis_data/
+
+# IDEs & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
