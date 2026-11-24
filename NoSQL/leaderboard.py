@@ -1,8 +1,10 @@
 from decimal import Decimal
 
+def format_product_id(product_id):
+    return f"{int(product_id):012d}"
 
 def record_purchase(r, user_id, product_id, price, event_time):
-    pid = str(product_id)
+    pid = format_product_id(product_id)
     uid = str(user_id)
     price_float = float(price)
 
@@ -28,7 +30,11 @@ def record_purchase(r, user_id, product_id, price, event_time):
 
 
 def increment_score(r, product_id):
-    r.zincrby("leaderboard:products", 1, str(product_id))
+    r.zincrby(
+        "leaderboard:products",
+        1,
+        format_product_id(product_id)
+    )
 
 
 def get_top_k(r, k=10):
@@ -51,14 +57,17 @@ def get_top_k(r, k=10):
 
 
 def get_rank(r, product_id):
+    rank = r.zrevrank(
+        "leaderboard:products",
+        format_product_id(product_id)
+    )
 
-    rank = r.zrevrank("leaderboard:products", str(product_id))
     return (rank + 1) if rank is not None else None
 
 
 def get_product(r, product_id):
 
-    pid = str(product_id)
+    pid = format_product_id(product_id)
     pipe = r.pipeline(transaction=False)
     pipe.hgetall(f"product:{pid}")
     pipe.zscore("leaderboard:products", pid)

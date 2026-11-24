@@ -30,7 +30,7 @@ def load_scale(size: int, batch_size: int = 5000) -> dict:
     with open(DATA_DIR / f"products_{size}.csv", mode="r", encoding="utf-8") as f:
         pipe = r.pipeline(transaction=False)
         for row in csv.DictReader(f):
-            pid = str(row["product_id"])
+            pid = f'{int(row["product_id"]):012d}'
             score = float(row["sales_count"])
             cat = row["category"]
             categories.add(cat)

@@ -61,11 +61,9 @@ def get_rank(conn, product_id):
                     SELECT COUNT(*)
                     FROM products p
                     WHERE
-                        p.sales_count > target.sales_count
-                        OR (
-                            p.sales_count = target.sales_count
-                            AND p.product_id > target.product_id
-                        )
+                        (p.sales_count, p.product_id)
+                        >
+                        (target.sales_count, target.product_id)
                 ) AS rank
                 FROM products target
                 WHERE target.product_id = %s;

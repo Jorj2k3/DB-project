@@ -1,615 +1,224 @@
 import time
 from pathlib import Path
-from decimal import Decimal
 from datetime import datetime, timezone
+from decimal import Decimal
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
+from SQL.sql_loader import get_pg_conn, load_scale as load_sql
+from NoSQL.redis_loader import get_redis_client, load_scale as load_redis
+from SQL import leaderboard as sql
+from NoSQL import leaderboard as nosql
 
-from SQL.sql_loader import get_pg_conn, load_scale
-from SQL.leaderboard import (
-    get_top_k,
-    get_rank,
-    get_product,
-    record_purchase
-)
-
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-RESULTS_DIR = BASE_DIR / "results"
-
-DATASET_SIZES = [1000, 10000, 100000]
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / 'data'
+RESULTS = ROOT / 'results'
+st.set_page_config(page_title='Online Shop', layout='wide')
 
 
-st.set_page_config(
-    page_title="Online Shopping Leaderboard",
-    page_icon="🏆",
-    layout="wide"
-)
+def timed(fn, client, *args):
+    start = time.perf_counter_ns()
+    result = fn(client, *args)
+    return result, (time.perf_counter_ns() - start) / 1e6
 
-st.title("Online Shopping Leaderboard")
 
-st.caption(
-    "Database Systems — PostgreSQL & Redis"
-)
-
-def execute_operation(operation, *args):
-
+def compare(pg_fn, redis_fn, *args):
     conn = get_pg_conn()
-
     try:
-
-        start = time.perf_counter_ns()
-
-        result = operation(conn, *args)
-
-        end = time.perf_counter_ns()
-
-        latency_ms = (end - start) / 1_000_000
-
-        return result, latency_ms
-
+        r = get_redis_client()
+        try:
+            r.ping()  # Establish Redis connection outside measured interval.
+            return timed(pg_fn, conn, *args), timed(redis_fn, r, *args)
+        finally:
+            r.close()
     finally:
         conn.close()
 
 
-def get_database_statistics(conn):
-
-    with conn:
-        with conn.cursor() as cur:
-
-            cur.execute("""
-                SELECT
-                    COUNT(*),
-                    COALESCE(SUM(sales_count), 0)
-                FROM products;
-            """)
-
-            product_count, total_sales = cur.fetchone()
-
-            cur.execute("""
-                SELECT COUNT(*) FROM users;
-            """)
-
-            user_count = cur.fetchone()[0]
-
-            cur.execute("""
-                SELECT COUNT(*) FROM purchases;
-            """)
-
-            purchase_count = cur.fetchone()[0]
-
-            return {
-                "products": product_count,
-                "users": user_count,
-                "total_sales": total_sales,
-                "purchases": purchase_count
-            }
-
-
 @st.cache_data
-def load_purchase_stream(size):
-
-    return pd.read_csv(
-        DATA_DIR / f"purchase_stream_{size}.csv"
-    )
+def read_data(size, kind):
+    return pd.read_csv(DATA / f'{kind}_{size}.csv')
 
 
-def display_product(product):
+def show_comparison(results, table=False):
+    for col, name, (value, ms) in zip(st.columns(2), ['PostgreSQL', 'Redis'], results):
+        with col:
+            st.subheader(name)
+            st.metric('Live latency', f'{ms:.3f} ms')
+            if table:
+                frame = pd.DataFrame(value, columns=['Product ID', 'Product name', 'Sales'])
+                frame.insert(0, 'Rank', range(1, len(frame)+1))
+                st.dataframe(frame, hide_index=True, use_container_width=True)
+            else:
+                st.metric('Rank', str(value) if value is not None else 'Not found')
+    if results[0][0] == results[1][0]:
+        st.success('Results match.')
+    else:
+        st.warning('Results differ. Check scores and numeric vs lexicographic tie-breaking.')
+    st.caption('Single client-side measurement; not a statistical benchmark.')
 
-    product_id, name, category, brand, price, sales = product
 
-    st.subheader(name)
+TOP_SQL = '''SELECT product_id, product_name, sales_count
+FROM products
+ORDER BY sales_count DESC, product_id DESC
+LIMIT %s'''
+RANK_SQL = '''SELECT 1 + (
+    SELECT COUNT(*) FROM products p
+    WHERE p.sales_count > target.sales_count
+       OR (p.sales_count = target.sales_count
+           AND p.product_id > target.product_id)
+) AS rank
+FROM products target WHERE target.product_id = %s'''
 
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric("Product ID", str(product_id))
-    col2.metric("Price", f"{price:,.2f}")
-    col3.metric("Sales count", f"{sales:,}")
-
-    st.write(f"**Category:** {category}")
-    st.write(f"**Brand:** {brand}")
-
-st.sidebar.header("Database Configuration")
-
-st.sidebar.selectbox(
-    "Database",
-    options=["PostgreSQL"]
-)
-
-dataset_size = st.sidebar.selectbox(
-    "Dataset size",
-    options=DATASET_SIZES,
-    format_func=lambda size: f"{size:,} products"
-)
-
-with_indexes = st.sidebar.checkbox(
-    "Enable secondary index",
-    value=True
-)
-
-st.sidebar.warning(
-    "Loading a dataset resets the current database."
-)
-
-if st.sidebar.button(
-    "Load Dataset",
-    use_container_width=True
-):
-
+st.sidebar.title('Database configuration')
+size = st.sidebar.selectbox('Dataset size', [1000, 10000, 100000], format_func=lambda n: f'{n:,}')
+indexed = st.sidebar.checkbox('PostgreSQL secondary index', value=True)
+if st.sidebar.button('Initialize databases'):
+    st.session_state.pop('loaded', None)
+    st.session_state.pop('last_purchase', None)
+    st.session_state.pop('inconsistent', None)
     try:
+        with st.spinner('Loading identical datasets...'):
+            load_sql(size, indexed)
+            load_redis(size)
+        st.session_state.loaded = (size, indexed)
+        st.session_state.purchase_count = 0
+        st.sidebar.success('Both databases initialized.')
+    except Exception as exc:
+        st.error(f'Initialization failed: {exc}')
 
-        with st.spinner("Loading dataset..."):
+page = st.sidebar.radio('Navigation', ['Shop', 'Live Leaderboard', 'Rank Lookup', 'Query Playground', 'Performance Analysis'])
+st.title('Online Shop | Database Comparison')
+st.caption('PostgreSQL & Redis — independent implementations of the same workload')
 
-            load_scale(
-                dataset_size,
-                with_indexes=with_indexes
-            )
-
-        st.session_state["loaded_size"] = dataset_size
-        st.session_state["loaded_indexes"] = with_indexes
-        st.session_state["purchase_position"] = 0
-
-        st.session_state.pop("last_purchase", None)
-
-        st.sidebar.success("Dataset loaded successfully!")
-
-    except Exception as error:
-
-        st.session_state.pop("loaded_size", None)
-        st.session_state.pop("loaded_indexes", None)
-
-        st.sidebar.error(str(error))
-
-
-if "loaded_size" not in st.session_state:
-
-    st.info(
-        "Select a dataset size and load the database "
-        "using the sidebar."
-    )
-
+if page == 'Performance Analysis':
+    st.header('Experimental results')
+    frames = []
+    for filename, database in [('sql_benchmark_rounds.csv', 'PostgreSQL'), ('redis_benchmark_rounds.csv', 'Redis')]:
+        path = RESULTS / filename
+        if path.exists():
+            df = pd.read_csv(path)
+            df['series'] = database if database == 'Redis' else df['with_indexes'].astype(str).str.lower().map({'true':'PostgreSQL with index','false':'PostgreSQL without index'})
+            frames.append(df)
+        else:
+            st.warning(f'Missing {filename}')
+    if frames:
+        df = pd.concat(frames, ignore_index=True)
+        st.metric('Recorded measurements', f"{df['operations'].sum():,}")
+        op = st.selectbox('Operation', ['top_k','rank_lookup','score_update'])
+        metric = st.selectbox('Metric', ['mean_ms','p95_ms','throughput_ops_sec'], format_func=lambda x: {'mean_ms':'Average latency (ms)','p95_ms':'Mean round P95 (ms)','throughput_ops_sec':'Throughput (ops/s)'}[x])
+        summary = df[df.operation == op].groupby(['dataset_size','series'])[metric].agg(['mean','std','count']).reset_index()
+        st.line_chart(summary.pivot(index='dataset_size', columns='series', values='mean').sort_index())
+        st.dataframe(summary, hide_index=True)
+        suffix = {'mean_ms':'mean_latency','p95_ms':'p95_latency','throughput_ops_sec':'throughput'}[metric]
+        plot = RESULTS / 'comparison_plots' / f'{op}_{suffix}.png'
+        if plot.exists():
+            st.image(str(plot), caption='Saved comparison plot')
+        st.caption('Mean and standard deviation across recorded rounds. P95 is averaged across rounds, not pooled.')
     st.stop()
 
-
-loaded_size = st.session_state["loaded_size"]
-loaded_indexes = st.session_state["loaded_indexes"]
-
-st.sidebar.divider()
-
-st.sidebar.write("**Active configuration**")
-st.sidebar.write(f"Dataset: {loaded_size:,} products")
-st.sidebar.write(
-    f"Secondary index: "
-    f"{'Enabled' if loaded_indexes else 'Disabled'}"
-)
-
-statistics, _ = execute_operation(
-    get_database_statistics
-)
-
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric(
-    "Products",
-    f"{statistics['products']:,}"
-)
-
-col2.metric(
-    "Users",
-    f"{statistics['users']:,}"
-)
-
-col3.metric(
-    "Total sales score",
-    f"{statistics['total_sales']:,}"
-)
-
-col4.metric(
-    "Simulated purchases",
-    f"{statistics['purchases']:,}"
-)
-
-st.divider()
-
-
-tab_leaderboard, tab_rank, tab_purchase, tab_performance = st.tabs([
-    "Leaderboard",
-    "Rank Lookup",
-    "Purchase Simulation",
-    "Performance Analysis"
-])
-
-with tab_leaderboard:
-
-    st.header("Best-Selling Products")
-
-    k = st.selectbox(
-        "Number of products",
-        options=[10, 20, 50, 100],
-        format_func=lambda value: f"Top {value}"
-    )
-
-    results, latency = execute_operation(
-        get_top_k,
-        k
-    )
-
-    leaderboard = pd.DataFrame(
-        results,
-        columns=[
-            "Product ID",
-            "Product Name",
-            "Sales Count"
-        ]
-    )
-
-    leaderboard.insert(
-        0,
-        "Rank",
-        range(1, len(leaderboard) + 1)
-    )
-
-    st.metric(
-        "Query latency",
-        f"{latency:.3f} ms"
-    )
-
-    st.dataframe(
-        leaderboard,
-        hide_index=True,
-        use_container_width=True
-    )
-
-    st.subheader("Top 10 Products by Sales")
-
-    chart_data = leaderboard.head(10).copy()
-
-    chart_data["Product"] = (
-        chart_data["Product Name"]
-        + " ("
-        + chart_data["Product ID"].astype(str)
-        + ")"
-    )
-
-    st.bar_chart(
-        chart_data.set_index("Product")["Sales Count"]
-    )
-
-with tab_rank:
-
-    st.header("Product Rank Lookup")
-
-    st.write(
-        "Find the current position of a product "
-        "in the global sales leaderboard."
-    )
-
-    with st.form("rank_lookup_form"):
-
-        product_id = st.number_input(
-            "Product ID",
-            min_value=1,
-            value=1801690,
-            step=1
-        )
-
-        search = st.form_submit_button(
-            "Find Product Rank"
-        )
-
-    if search:
-
-        product, _ = execute_operation(
-            get_product,
-            int(product_id)
-        )
-
-        if product is None:
-
-            st.warning("Product not found.")
-
-        else:
-
-            rank, latency = execute_operation(
-                get_rank,
-                int(product_id)
-            )
-
-            display_product(product)
-
-            st.divider()
-
-            col1, col2 = st.columns(2)
-
-            col1.metric(
-                "Leaderboard rank",
-                f"#{rank:,}"
-            )
-
-            col2.metric(
-                "Query latency",
-                f"{latency:.3f} ms"
-            )
-
-with tab_purchase:
-
-    st.header("Purchase Simulation")
-
-    st.write(
-        "Replay purchase events and observe "
-        "real-time leaderboard updates."
-    )
-
-    purchase_stream = load_purchase_stream(
-        loaded_size
-    )
-
-    position = st.session_state.get(
-        "purchase_position",
-        0
-    )
-
-    st.progress(
-        position / len(purchase_stream)
-    )
-
-    st.caption(
-        f"Processed purchases: "
-        f"{position:,} / {len(purchase_stream):,}"
-    )
-
-    if position < len(purchase_stream):
-
-        purchase = purchase_stream.iloc[position]
-
-        user_id = int(purchase["user_id"])
-        product_id = int(purchase["product_id"])
-        price = Decimal(str(purchase["price"]))
-
-        product, _ = execute_operation(
-            get_product,
-            product_id
-        )
-
-        st.subheader("Next Purchase Event")
-
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric("User ID", str(user_id))
-        col2.metric("Product ID", str(product_id))
-        col3.metric("Purchase price", f"{price:.2f}")
-
-        if product is not None:
-
-            st.write(f"**Product:** {product[1]}")
-            st.write(f"**Current score:** {product[5]:,}")
-
-        if st.button("Simulate Next Purchase"):
-
-            try:
-
-                before, _ = execute_operation(
-                    get_product,
-                    product_id
-                )
-
-                rank_before, _ = execute_operation(
-                    get_rank,
-                    product_id
-                )
-
-                _, latency = execute_operation(
-                    record_purchase,
-                    user_id,
-                    product_id,
-                    price,
-                    datetime.now(timezone.utc)
-                )
-
-                after, _ = execute_operation(
-                    get_product,
-                    product_id
-                )
-
-                rank_after, _ = execute_operation(
-                    get_rank,
-                    product_id
-                )
-
-                st.session_state["last_purchase"] = {
-                    "product_name": after[1],
-                    "score_before": before[5],
-                    "score_after": after[5],
-                    "rank_before": rank_before,
-                    "rank_after": rank_after,
-                    "latency": latency
-                }
-
-                st.session_state["purchase_position"] += 1
-
-                st.rerun()
-
-            except Exception as error:
-
-                st.error(str(error))
-
-    else:
-
-        st.info("All purchase events have been processed.")
-
-
-    if "last_purchase" in st.session_state:
-
-        result = st.session_state["last_purchase"]
-
-        st.divider()
-
-        st.success("Purchase recorded successfully!")
-
-        st.subheader(result["product_name"])
-
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric(
-            "Updated sales score",
-            f"{result['score_after']:,}",
-            delta=(
-                result["score_after"]
-                - result["score_before"]
-            )
-        )
-
-        col2.metric(
-            "Updated rank",
-            f"#{result['rank_after']:,}",
-            delta=(
-                result["rank_before"]
-                - result["rank_after"]
-            )
-        )
-
-        col3.metric(
-            "Transaction latency",
-            f"{result['latency']:.3f} ms"
-        )
-
-        st.caption(
-            f"Previous rank: #{result['rank_before']:,}"
-        )
-
-with tab_performance:
-
-    st.header("PostgreSQL Performance Analysis")
-
-    benchmark_path = (
-        RESULTS_DIR / "sql_benchmark_rounds.csv"
-    )
-
-    if not benchmark_path.exists():
-
-        st.warning("Benchmark results not found.")
-
-    else:
-
-        benchmark = pd.read_csv(benchmark_path)
-
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric(
-            "Benchmark rounds",
-            benchmark["round"].nunique()
-        )
-
-        col2.metric(
-            "Dataset sizes",
-            benchmark["dataset_size"].nunique()
-        )
-
-        col3.metric(
-            "Measured operations",
-            f"{benchmark['operations'].sum():,}"
-        )
-
-        st.divider()
-
-        operation_labels = {
-            "top_k": "Top-K Retrieval",
-            "rank_lookup": "Rank Lookup",
-            "score_update": "Score Update"
-        }
-
-        selected_operation = st.selectbox(
-            "Operation",
-            options=list(operation_labels.keys()),
-            format_func=lambda value: operation_labels[value]
-        )
-
-        metric_labels = {
-            "mean_ms": "Average latency (ms)",
-            "p95_ms": "P95 latency (ms)",
-            "throughput_ops_sec": "Throughput (operations/s)"
-        }
-
-        selected_metric = st.selectbox(
-            "Performance metric",
-            options=list(metric_labels.keys()),
-            format_func=lambda value: metric_labels[value]
-        )
-
-        filtered = benchmark[
-            benchmark["operation"] == selected_operation
-        ].copy()
-
-        filtered["Configuration"] = filtered[
-            "with_indexes"
-        ].map({
-            False: "Without secondary index",
-            True: "With secondary index"
-        })
-
-        aggregated = (
-            filtered.groupby(
-                ["dataset_size", "Configuration"]
-            )[selected_metric]
-            .agg(["mean", "std"])
-            .reset_index()
-        )
-
-        chart_data = aggregated.pivot(
-            index="dataset_size",
-            columns="Configuration",
-            values="mean"
-        )
-
-        chart_data = chart_data.sort_index()
-
-        chart_data.index = [
-            f"{size // 1000}k"
-            for size in chart_data.index
-        ]
-
-        st.subheader(
-            operation_labels[selected_operation]
-        )
-
-        st.caption(
-            metric_labels[selected_metric]
-        )
-
-        st.line_chart(
-            chart_data,
-            color=["#9674CB", "#9B9BA8"]
-        )
-
-        st.subheader("Aggregated Results")
-
-        st.dataframe(
-            aggregated.rename(columns={
-                "dataset_size": "Dataset size",
-                "mean": "Mean",
-                "std": "Standard deviation"
-            }).round(4),
-            hide_index=True,
-            use_container_width=True
-        )
-
-        st.caption(
-            "Statistics aggregated across benchmark rounds."
-        )
-
-        with st.expander("View raw benchmark results"):
-
-            st.dataframe(
-                filtered,
-                hide_index=True,
-                use_container_width=True
-            )
-
-        st.download_button(
-            label="Download Benchmark Results",
-            data=benchmark.to_csv(index=False),
-            file_name="sql_benchmark_rounds.csv",
-            mime="text/csv"
-        )
+if 'loaded' not in st.session_state:
+    st.info('Initialize both databases using the sidebar to start the demo.')
+    st.stop()
+active_size, active_index = st.session_state.loaded
+st.sidebar.info(f'Active: {active_size:,} products | Secondary index: {active_index}')
+if (size, indexed) != (active_size, active_index):
+    st.sidebar.warning('Selection not applied. Initialize to change configuration.')
+if st.session_state.get('inconsistent'):
+    st.error('A purchase may have been applied to only one database. Reinitialize before continuing.')
+    st.stop()
+
+products = read_data(active_size, 'products')
+users = read_data(active_size, 'users')
+
+
+def select_product(key):
+    pid = st.number_input('Product ID', min_value=1, value=int(products.iloc[0].product_id), step=1, key=key)
+    return int(pid)
+
+
+try:
+    if page == 'Shop':
+        st.header('Product catalog')
+        a,b,c = st.columns(3)
+        a.metric('Products', f'{active_size:,}')
+        b.metric('Users', f'{len(users):,}')
+        c.metric('Demo purchases', st.session_state.purchase_count)
+        category = st.selectbox('Category', ['All categories'] + sorted(products.category.dropna().unique().tolist()))
+        search = st.text_input('Search product name or ID')
+        catalog = products if category == 'All categories' else products[products.category == category]
+        if search:
+            catalog = catalog[catalog.product_name.str.contains(search, case=False, regex=False, na=False) | catalog.product_id.astype(str).str.contains(search, regex=False)]
+        catalog = catalog.sort_values(['sales_count','product_id'], ascending=False)
+        st.caption(f'{len(catalog):,} matching products; catalog ordered by initial sales.')
+        uid = int(st.number_input('Customer ID', min_value=1, value=int(users.iloc[0].user_id), step=1))
+        cols = st.columns(3)
+        for i, row in enumerate(catalog.head(9).itertuples()):
+            pid = int(row.product_id)
+            with cols[i % 3]:
+                with st.container(border=True):
+                    st.markdown(f'**{row.product_name}**')
+                    st.caption(f'{row.brand} | {row.category} | ID {pid}')
+                    st.metric('Price (dataset units)', f'{row.price:.2f}')
+                    if st.button('Buy now', key=f'buy_{pid}', use_container_width=True):
+                        if uid not in set(users.user_id):
+                            st.error('Customer ID does not exist.')
+                        else:
+                            before = compare(sql.get_product, nosql.get_product, pid)
+                            ranks_before = compare(sql.get_rank, nosql.get_rank, pid)
+                            try:
+                                writes = compare(sql.record_purchase, nosql.record_purchase, uid, pid, Decimal(str(row.price)), datetime.now(timezone.utc))
+                                after = compare(sql.get_product, nosql.get_product, pid)
+                                ranks_after = compare(sql.get_rank, nosql.get_rank, pid)
+                                st.session_state.last_purchase = (pid, before, after, ranks_before, ranks_after, writes)
+                                st.session_state.purchase_count += 1
+                            except Exception:
+                                st.session_state.inconsistent = True
+                                raise
+                            st.rerun()
+        if 'last_purchase' in st.session_state:
+            pid, before, after, rb, ra, writes = st.session_state.last_purchase
+            st.subheader(f'Last purchase — product {pid}')
+            for i, col in enumerate(st.columns(2)):
+                with col:
+                    st.markdown(f"**{['PostgreSQL','Redis'][i]}**")
+                    st.metric('Sales', after[i][0][5], int(after[i][0][5])-int(before[i][0][5]))
+                    st.metric('Rank', ra[i][0], rb[i][0]-ra[i][0])
+                    st.metric('Full purchase latency', f'{writes[i][1]:.3f} ms')
+            if after[0][0][5] != after[1][0][5]:
+                st.error('Product scores differ.')
+            elif ra[0][0] != ra[1][0]:
+                st.warning('Scores match but ranks differ; check tie-breaking.')
+            else:
+                st.success('Product score and rank match.')
+            st.caption('Full purchase operations differ in scope from the score-update microbenchmark.')
+    elif page == 'Live Leaderboard':
+        st.header('Live leaderboard')
+        k = st.selectbox('Top K', [10,20,50,100])
+        if st.button('Retrieve leaderboard'):
+            show_comparison(compare(sql.get_top_k, nosql.get_top_k, k), table=True)
+    elif page == 'Rank Lookup':
+        st.header('Exact product rank')
+        pid = select_product('rank_id')
+        if st.button('Find rank'):
+            show_comparison(compare(sql.get_rank, nosql.get_rank, pid))
+        st.markdown('PostgreSQL counts preceding rows; Redis uses an ordered Sorted Set with rank support.')
+    elif page == 'Query Playground':
+        st.header('Query playground')
+        choice = st.radio('Query', ['Top-K products','Exact product rank'])
+        top = choice == 'Top-K products'
+        arg = st.selectbox('K', [10,20,50,100], key='query_k') if top else select_product('query_id')
+        query = TOP_SQL if top else RANK_SQL
+        left,right = st.columns(2)
+        with left:
+            st.subheader('PostgreSQL')
+            st.code(query.replace('%s', str(arg)), language='sql')
+        with right:
+            st.subheader('Redis')
+            st.code(f'ZRANGE leaderboard:products 0 {arg-1} REV WITHSCORES\n# HGET product:<id> name (pipeline)' if top else f'ZREVRANK leaderboard:products {arg}\n# Add 1 to obtain application rank', language='text')
+        if st.button('Execute both queries'):
+            show_comparison(compare(sql.get_top_k if top else sql.get_rank, nosql.get_top_k if top else nosql.get_rank, arg), table=top)
+except Exception as exc:
+    st.error(f'Operation failed: {exc}')
+    if st.session_state.get('inconsistent'):
+        st.warning('Do not retry the purchase. Reinitialize both databases first.')
