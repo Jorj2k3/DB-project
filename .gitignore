@@ -31,3 +31,4 @@ redis_data/
 .idea/
 .DS_Store
 Thumbs.db
+NoSQL/test.py

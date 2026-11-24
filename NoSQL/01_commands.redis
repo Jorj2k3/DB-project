@@ -1,0 +1,27 @@
+# 1. Seed a product, category index, and buyer
+HSET product:1004237 name "Apple Smartphone (#1004237)" category "smartphone" brand "Apple" price "1081.98"
+ZADD leaderboard:products 150 "1004237"
+ZADD leaderboard:category:smartphone 150 "1004237"
+ZADD leaderboard:buyers 2163.96 "541312140"
+
+# 2. Record a purchase across all structures + Stream
+ZINCRBY leaderboard:products 1 "1004237"
+ZINCRBY leaderboard:category:smartphone 1 "1004237"
+ZINCRBY leaderboard:buyers 1081.98 "541312140"
+XADD stream:purchases MAXLEN ~ 1000 * user_id "541312140" product_id "1004237" price "1081.98"
+
+# 3. Global Top 10 Products (Redis 6.2+ ZRANGE ... REV syntax)
+ZRANGE leaderboard:products 0 9 REV WITHSCORES
+
+# 4. Category-Filtered Top 10 (Sharded Secondary Index)
+ZRANGE leaderboard:category:smartphone 0 9 REV WITHSCORES
+
+# 5. Exact Rank & Score of a Product
+ZREVRANK leaderboard:products "1004237"
+ZSCORE leaderboard:products "1004237"
+
+# 6. Global Top 10 Spending Buyers
+ZRANGE leaderboard:buyers 0 9 REV WITHSCORES
+
+# 7. Inspect Memory Footprint
+MEMORY USAGE leaderboard:products
